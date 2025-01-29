@@ -3,6 +3,7 @@ import scipy
 import scipy.linalg
 import cvxpy as cp
 
+from tqdm import tqdm
 from scipy.optimize import minimize
 
 
@@ -15,7 +16,7 @@ def map_estimation(
     lambda0: float,
     lambda1: float,
     convergence_criterion: float = 0.05,
-    forced_stop: int = 500,
+    num_iter: int = 500,
 ):
     """
     Get MAP estimates for B, Sigma and Theta.
@@ -43,45 +44,47 @@ def map_estimation(
     num_var, num_obs = Y.shape
     _, num_factors = B.shape
 
-    count = 0
-
     error = np.inf
     B_star_old = np.zeros((num_factors, num_var))
-    while error > convergence_criterion:
 
-        # E-Step
-        Omega, M = update_latent_features(B, Sigma, Y, num_factors)
-        Gamma = get_latent_indicators(B, Theta, lambda0, lambda1)
+    with tqdm(total=num_iter, desc="PXL-EM", unit="iter") as pbar:
+        for _ in range(num_iter):
 
-        # M-Step
-        ## Set new variables
-        Y_tilde = np.vstack([Y.T, np.zeros((num_factors, num_var))])  # size ((K+n)*G)
-        Omega_tilde = get_Omega_tilde(Omega, M, num_obs)
-        B_star = np.zeros((num_factors, num_var))
-        Theta = np.zeros(num_factors)
-        A = update_rotation(Omega, M, num_obs)
-        ## Update
-        for j in range(num_var):
-            beta_j_star = update_loading(
-                Y_tilde, Omega_tilde, Sigma, Gamma, num_factors, j
-            )
-            B_star[:, j] = beta_j_star
-            sigma_j = update_variance(Y_tilde, Omega_tilde, beta_j_star, num_obs, j)
-            Sigma[j] = sigma_j
-        print(Sigma)
+            # E-Step
+            Omega, M = update_latent_features(B, Sigma, Y, num_factors)
+            Gamma = get_latent_indicators(B, Theta, lambda0, lambda1)
 
-        Theta = update_sparsity(Gamma, alpha)
-        # Rotation Step
-        B = rotation(B_star.T, A)
+            # M-Step
+            ## Set new variables
+            Y_tilde = np.vstack(
+                [Y.T, np.zeros((num_factors, num_var))]
+            )  # size ((K+n)*G)
+            Omega_tilde = get_Omega_tilde(Omega, M, num_obs)
+            B_star = np.zeros((num_factors, num_var))
+            Theta = np.zeros(num_factors)
+            A = update_rotation(Omega, M, num_obs)
+            ## Update
+            for j in range(num_var):
+                B_star[:, j] = update_loading(
+                    Y_tilde, Omega_tilde, Sigma, Gamma, num_factors, j
+                )
+                Sigma[j] = update_variance(Y_tilde, Omega_tilde, B_star, num_obs, j)
 
-        # Update distance
-        error = infinite_norm_distance(B_star, B_star_old)
-        B_star_old = B_star
-        count += 1
-        if count > forced_stop:
-            break
+            Theta = update_sparsity(Gamma, alpha)
+            # Rotation Step
+            B = rotation(B_star.T, A)
 
-    return B, Sigma, Theta
+            # Update distance
+            error = infinite_norm_distance(B_star, B_star_old)
+            B_star_old = B_star
+
+            pbar.set_postfix({"error": f"{error:.5f}"})
+            pbar.update(1)
+
+            if error < convergence_criterion:
+                break
+
+    return B, Sigma, Theta, Omega
 
 
 ######## E-Step
@@ -176,7 +179,7 @@ def update_loading(Y_tilde, Omega_tilde, Sigma, Gamma, num_factor, j):
     return B_j_star
 
 
-def update_variance(Y_tilde, Omega_tilde, beta_j_star, num_obs, j):
+def update_variance(Y_tilde, Omega_tilde, B_star, num_obs, j):
     """
     Update the jth diagonal coefficient of Sigma.
 
@@ -190,8 +193,9 @@ def update_variance(Y_tilde, Omega_tilde, beta_j_star, num_obs, j):
     Returns:
         sigma_j (float)
     """
-    residuals = Y_tilde[:, j] - Omega_tilde @ beta_j_star
-    return (np.sum(residuals**2) + 1) / (num_obs + 1)
+    return (np.sum((Y_tilde[:, j] - Omega_tilde @ B_star[:, j]) ** 2) + 1) / (
+        num_obs + 1
+    )
 
 
 def update_rotation(Omega, M, num_obs):
