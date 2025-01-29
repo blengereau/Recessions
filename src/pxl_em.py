@@ -1,6 +1,7 @@
 import numpy as np
 import scipy
 import scipy.linalg
+import cvxpy as cp
 
 from scipy.optimize import minimize
 
@@ -45,36 +46,31 @@ def map_estimation(
     count = 0
 
     error = np.inf
-    B_star_old = np.zeros(num_factors, num_var).to(B.device)
+    B_star_old = np.zeros((num_factors, num_var))
     while error > convergence_criterion:
 
         # E-Step
-        Omega, M = get_latent_features(B, Sigma, Y, num_factors)
-        gamma = get_latent_indicators(B, Theta, lambda0, lambda1)
+        Omega, M = update_latent_features(B, Sigma, Y, num_factors)
+        Gamma = get_latent_indicators(B, Theta, lambda0, lambda1)
 
-        # M-Stepbeta
+        # M-Step
         ## Set new variables
-        Y_tilde = np.pad(
-            Y.T, (0, 0, 0, num_factors), mode="constant", value=0
-        )  # size ((K+n)*G)
+        Y_tilde = np.vstack([Y.T, np.zeros((num_factors, num_var))])  # size ((K+n)*G)
         Omega_tilde = get_Omega_tilde(Omega, M, num_obs)
-        B_star = np.zeros(num_factors, num_var).to(B.device)
-        Theta = np.zeros(num_factors).to(B.device)
-        A = get_rotation_matrix(Omega, M, num_obs)
-
+        B_star = np.zeros((num_factors, num_var))
+        Theta = np.zeros(num_factors)
+        A = update_rotation(Omega, M, num_obs)
         ## Update
         for j in range(num_var):
-            beta_j_star = get_loading(
-                Y_tilde, Omega_tilde, B, Sigma, gamma, A, num_factors, j
+            beta_j_star = update_loading(
+                Y_tilde, Omega_tilde, Sigma, Gamma, num_factors, j
             )
             B_star[:, j] = beta_j_star
-            sigma_j = get_variance(Y_tilde, Omega_tilde, beta_j_star, num_obs, j)
+            sigma_j = update_variance(Y_tilde, Omega_tilde, beta_j_star, num_obs, j)
             Sigma[j] = sigma_j
+        print(Sigma)
 
-        for k in range(num_factors):
-            theta_k = get_weight(gamma, alpha, num_var, num_factors, k)
-            Theta[k] = theta_k
-
+        Theta = update_sparsity(Gamma, alpha)
         # Rotation Step
         B = rotation(B_star.T, A)
 
@@ -89,7 +85,7 @@ def map_estimation(
 
 
 ######## E-Step
-def get_latent_features(B, Sigma, Y, num_factors):
+def update_latent_features(B, Sigma, Y, num_factors):
     """
     Extract the latent features mean.
 
@@ -104,7 +100,7 @@ def get_latent_features(B, Sigma, Y, num_factors):
         M (np.tensor): size (K*K)
     """
 
-    precision = np.eye(num_factors, device=B.device) + B.T @ np.diag(1 / Sigma) @ B
+    precision = np.eye(num_factors) + B.T @ np.diag(1 / Sigma) @ B
     M = np.linalg.inv(precision)
     Omega = M @ B.T @ np.diag(1 / Sigma) @ Y
 
@@ -147,7 +143,7 @@ def get_Omega_tilde(Omega, M, num_obs):
     """
     M_L = scipy.linalg.cholesky(M, lower=True)
     low = np.sqrt(num_obs) * M_L
-    return np.cat([Omega.T.unsqueeze(0), low.unsqueeze(0)], dim=1).squeeze()
+    return np.vstack([Omega.T, low])
 
 
 def update_loading(Y_tilde, Omega_tilde, Sigma, Gamma, num_factor, j):
@@ -171,7 +167,7 @@ def update_loading(Y_tilde, Omega_tilde, Sigma, Gamma, num_factor, j):
     """
 
     def objective(B_j_star):
-        return -np.sum((Y_tilde[:, j] - Omega_tilde @ B_j_star) ** 2) - 2 * Sigma[
+        return np.sum((Y_tilde[:, j] - Omega_tilde @ B_j_star) ** 2) + 2 * Sigma[
             j
         ] ** 2 * np.sum(np.abs(B_j_star * Gamma[j, :]))
 
@@ -202,24 +198,22 @@ def update_rotation(Omega, M, num_obs):
     return (Omega @ Omega.T) / num_obs + M
 
 
-def get_weight(gamma, alpha, num_var, num_factor, k):
-    """
-    Get theta_k.
+def update_sparsity(Gamma, alpha):
+    K = Gamma.shape[1]
+    theta = cp.Variable(K, nonneg=True)
 
-    Args:
-        gamma (np.tensor): size (G*K)
-        alpha (float)
-        num_var (int)
-        num_factor(int)
-        k (int)
-
-    Returns:
-        theta_k (float)
-    """
-    indicators_sum = np.sum(gamma[:, k])
-    return (indicators_sum + alpha / num_factor - 1) / (
-        alpha / num_factor + 1 + num_var - 2
+    # Objective function and constraints
+    objective = cp.Maximize(
+        cp.sum(cp.multiply(Gamma, cp.log(theta)))
+        + cp.sum(cp.multiply(1 - Gamma, cp.log(1 - theta)))
+        + (1 - alpha) * cp.log(theta[-1])
     )
+    constraints = [theta[k] - theta[k - 1] <= 0 for k in range(1, K)] + [theta <= 1]
+
+    # Solve the problem
+    cp.Problem(objective, constraints).solve()
+
+    return theta.value
 
 
 ######## Rotation Step
@@ -238,7 +232,7 @@ def rotation(B_star, A):
     """
     A_L = scipy.linalg.cholesky(A, lower=True)  # size (K*K)
 
-    return B_star.to(np.float64) @ A_L.to(np.float64)
+    return B_star @ A_L
 
 
 ######## Convergence criterion
@@ -262,6 +256,6 @@ def infinite_norm_distance(A, B):
     diff = np.abs(A - B)
 
     # Compute the row sums
-    row_sums = np.sum(diff, dim=1)
+    row_sums = np.sum(diff, axis=1)
 
     return np.max(row_sums).item()
