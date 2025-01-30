@@ -47,6 +47,8 @@ def map_estimation(
     error = np.inf
     B_star_old = np.zeros((num_factors, num_var))
 
+    history = {}
+
     with tqdm(total=num_iter, desc="PXL-EM", unit="iter") as pbar:
         for _ in range(num_iter):
 
@@ -84,7 +86,9 @@ def map_estimation(
             if error < convergence_criterion:
                 break
 
-    return B, Sigma, Theta, Omega
+            history[error] = {"B": B, "Sigma": Sigma, "Theta": Theta, "Omega": Omega}
+
+    return history
 
 
 ######## E-Step
